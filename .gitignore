@@ -1,0 +1,22 @@
+# Credenciais — NUNCA subir
+.env
+.env.local
+
+# Ambiente Python
+.venv/
+__pycache__/
+*.pyc
+
+# Saídas do script
+output/
+
+# IDE / Sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temp Office
+~$*.docx
+~$*.xlsx

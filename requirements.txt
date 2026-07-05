@@ -1,0 +1,5 @@
+snowflake-connector-python[secure-local-storage]>=3.7.0
+pandas>=2.0.0
+python-docx>=1.0.0
+python-dotenv>=1.0.0
+matplotlib>=3.8.0
