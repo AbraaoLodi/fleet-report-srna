@@ -435,7 +435,7 @@ rank_wtg AS (
     GROUP BY WTG
     HAVING n_crit > 0 OR n_alerta > 0
     ORDER BY n_crit DESC, pico_geral DESC
-    LIMIT 5
+    LIMIT 7
 )
 SELECT
     s.WTG                          AS wtg,

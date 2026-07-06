@@ -128,7 +128,7 @@ def construir_pg5(doc, df_temp: pd.DataFrame, periodo_str: str) -> None:
 
     add_kpi_cards(doc, [
         {"label": "WTGs com alerta/crítico", "valor": str(n_wtgs),
-         "sub": "no período (top 5 exibidas)"},
+         "sub": f"no período (top {n_wtgs} exibidas)"},
         {"label": "Sensores críticos", "valor": str(n_criticos),
          "sub": f"{n_alertas} em alerta (amarelo)"},
         {"label": "Componente dominante", "valor": comp_dom,
@@ -175,7 +175,7 @@ def construir_pg5(doc, df_temp: pd.DataFrame, periodo_str: str) -> None:
         col_widths_pct=col_widths,
         col_status=5,          # coluna Status recebe cor automática
         first_col_bold=True,
-        titulo=f"Top 5 WTGs com maiores temperaturas — {periodo_str}",
+        titulo=f"Top {n_wtgs} WTGs com maiores temperaturas — {periodo_str}",
     )
 
     # ----- Nota metodológica -----
