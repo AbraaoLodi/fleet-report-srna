@@ -1,194 +1,109 @@
-"""Pg 5 — 04. Análise de Temperatura.
+"""Pg 5 — 05. Monitoramento de Temperatura (ML + SCADA).
 
-Lista as Top 5 WTGs que cruzaram algum limite de temperatura na semana
-(últimos 7 dias), detalhando TODOS os componentes quentes de cada uma
-(gerador enrolamento/rolamento/slipring, gearbox, conversor, trafo, nacele).
-
-Fonte dos limites (oficial, mesma do cockpit):
-    OEM_PROD.MACHINE_LEARNING.F_REAL_EOL_WTG_TEMPERATURE_ANOMALY_EVENTS_DAILY
-      · DERATE_LIMIT   -> limite amarelo (alerta / derate)
-      · DOWNTIME_LIMIT -> limite vermelho (crítico / parada)
-      · MAX_TEMP       -> pico diário
-
-Pico (MAX) e limites vêm da tabela ML; a média (AVG) vem do SCADA_RAW.
-
-Classificação por sensor:
-    pico >= downtime            -> CRÍTICO   (vermelho)
-    derate <= pico < downtime   -> ALERTA    (amarelo)
-    pico < derate               -> NORMAL    (não listado)
-    sensor inválido (>50% ruim) -> SENSOR C/ FALHA
-
-Regras de dado:
-    - leitura inválida: VALUE <= 0 ou VALUE >= 200
-    - sempre o UPLOADED_AT mais recente (CTE last_upload)
+Classifica cada sensor pelo mapa da frota (data/mapa_temperatura.json):
+CRITICO (componente de desgaste) vai para a tabela hierárquica principal;
+AUX (refrigeração/ambiente) vai para uma nota compacta abaixo.
+Os limites vêm dinamicamente da query (por frota), não hardcoded.
 """
 from __future__ import annotations
-
+import json
+from pathlib import Path
 import pandas as pd
+from utils.docx_helpers import (add_capitulo, add_tabela_hierarquica_temp, quebra_pagina,
+    add_paragrafo, add_banner, HEX_CINZA_CLARO)
+from utils.formatters import fmt_float
 
-from utils.docx_helpers import (
-    HEX_CORAL, HEX_AMARELO, HEX_VERDE, HEX_CINZA_CLARO, HEX_GRAFITE,
-    add_capitulo, add_kpi_cards, add_tabela, add_banner, add_paragrafo,
-)
-from utils.logger import get_logger
+_MAPA_PATH = Path(__file__).resolve().parent.parent / "data" / "mapa_temperatura.json"
+try:
+    _MAPA_TEMP = json.load(open(_MAPA_PATH, encoding="utf-8"))
+except Exception:
+    _MAPA_TEMP = {}
 
-log = get_logger(__name__)
+def _ordem(rotulo):
+    r = rotulo.lower()
+    if "enrol" in r and "gerador" in r: return 0
+    if "rolam" in r and "gerador" in r: return 1
+    if "slipring" in r: return 2
+    if "rolamento principal" in r: return 3
+    if "gearbox" in r: return 4
+    if "hidráulic" in r: return 5
+    if "trafo" in r: return 6
+    if "pitch" in r: return 7
+    return 9
 
+def _sev_txt(sev):
+    return {2:"Crítico",1:"Atenção"}.get(int(sev),"Normal")
 
-# ---------------------------------------------------------------------------
-# Rótulos de status (batem com STATUS_COLORS do docx_helpers)
-# ---------------------------------------------------------------------------
-ST_CRITICO = "Crítico"     # -> coral bold
-ST_ALERTA  = "Atenção"     # -> amarelo bold
-ST_FALHA   = "Sensor c/ falha"
+def _classificar(frota_key, variable):
+    mapa = _MAPA_TEMP.get(frota_key, {})
+    if variable in mapa:
+        rot, cat = mapa[variable]
+        return rot, cat
+    return variable.replace("_TEMP","").replace("_"," ").title(), "AUX"
 
-# ordem de exibição dos componentes dentro de cada WTG
-ORDEM_COMPONENTE = {
-    "Gerador enrol.":    0,
-    "Gerador rolam.":    1,
-    "Gerador slipring":  2,
-    "Gearbox":           3,
-    "Conversor":         4,
-    "Trafo":             5,
-    "Nacele":            6,
-    "Outro":             9,
-}
-
-
-def _fmt_temp(v) -> str:
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return "—"
-    return f"{float(v):.1f}".replace(".", ",") + "°C"
-
-
-def _fmt_limite(derate, downtime) -> str:
-    """Ex.: '130 / 135' (amarelo / vermelho)."""
-    def _n(x):
-        if x is None or (isinstance(x, float) and pd.isna(x)):
-            return "—"
-        return f"{int(round(float(x)))}"
-    return f"{_n(derate)} / {_n(downtime)}"
-
-
-def _status_label(sev: int) -> str:
-    if sev >= 2:
-        return ST_CRITICO
-    if sev == 1:
-        return ST_ALERTA
-    return "Normal"
-
-
-def construir_pg5(doc, df_temp: pd.DataFrame, periodo_str: str) -> None:
-    """Constrói a página de Análise de Temperatura.
-
-    df_temp — uma linha por WTG × componente que cruzou limite, colunas:
-        WTG, COMPONENTE, PICO, MEDIA, DERATE, DOWNTIME, SEV, N_CRIT, N_ALERTA
-      (SEV: 2=crítico, 1=alerta; N_CRIT/N_ALERTA são por WTG, p/ ranking)
-    """
-    add_capitulo(
-        doc, "04", "Análise de Temperatura",
-        f"WTGs com sensores acima do limite · {periodo_str}",
-    )
-
+def construir_pg5(doc, df_temp, periodo_str="", frota_key="SG"):
+    add_capitulo(doc, "05", "Monitoramento de Temperatura",
+        f"Sensores com pico acima dos limites do fabricante · janela {periodo_str} · \u26a0 alerta (derate) · \u26d4 crítico (downtime)")
     if df_temp is None or df_temp.empty:
-        add_banner(
-            doc,
-            "Nenhuma WTG cruzou limite de temperatura no período. "
-            "Todos os sensores dentro da faixa normal (abaixo do derate).",
-            cor=HEX_VERDE,
-        )
-        _rodape_metodologia(doc)
-        return
+        add_paragrafo(doc, "Nenhum sensor acima dos limites no período.", size=10, color=HEX_CINZA_CLARO)
+        quebra_pagina(doc); return
 
     df = df_temp.copy()
     df.columns = [c.upper() for c in df.columns]
-
-    # ----- KPIs do topo -----
-    n_wtgs = df["WTG"].nunique()
-    n_criticos = int((df["SEV"] >= 2).sum())
-    n_alertas = int((df["SEV"] == 1).sum())
-
-    # componente que mais aparece como crítico (curto p/ caber no card)
-    crit = df[df["SEV"] >= 2]
-    if not crit.empty:
-        comp_full = crit["COMPONENTE"].value_counts().idxmax()
-        # primeira palavra ("Gerador enrol." -> "Gerador") p/ caber na fonte grande
-        comp_dom = comp_full.split()[0]
-    else:
-        comp_dom = "—"
-
-    # pior WTG (maior pico crítico)
-    if not crit.empty:
-        pior = crit.loc[crit["PICO"].idxmax()]
-        pior_valor = _fmt_temp(pior["PICO"])
-        pior_sub = f"{pior['WTG']} · maior pico crítico"
-    else:
-        pior_valor = "—"
-        pior_sub = "sem pico crítico"
-
-    add_kpi_cards(doc, [
-        {"label": "WTGs com alerta/crítico", "valor": str(n_wtgs),
-         "sub": f"no período (top {n_wtgs} exibidas)"},
-        {"label": "Sensores críticos", "valor": str(n_criticos),
-         "sub": f"{n_alertas} em alerta (amarelo)"},
-        {"label": "Componente dominante", "valor": comp_dom,
-         "sub": "mais recorrente nos críticos"},
-        {"label": "Pior pico", "valor": pior_valor,
-         "sub": pior_sub},
-    ])
-
-    # ----- Ordena: WTG por ranking (n_crit desc), componente por ordem física -----
-    df["ORD_COMP"] = df["COMPONENTE"].map(ORDEM_COMPONENTE).fillna(9)
-    # chave de ranking da WTG: usa N_CRIT e maior pico
-    rank = (df.groupby("WTG")
-              .agg(n_crit=("N_CRIT", "max"),
-                   n_alerta=("N_ALERTA", "max"),
-                   pico_max=("PICO", "max"))
-              .reset_index()
-              .sort_values(["n_crit", "pico_max"], ascending=[False, False]))
-    ordem_wtg = {w: i for i, w in enumerate(rank["WTG"])}
-    df["ORD_WTG"] = df["WTG"].map(ordem_wtg)
-    df = df.sort_values(["ORD_WTG", "ORD_COMP"]).reset_index(drop=True)
-
-    # ----- Monta linhas da tabela (WTG só aparece na 1ª linha do grupo) -----
-    headers = ["WTG", "Componente", "Pico", "Média", "Limite (⚠/⛔)", "Status"]
-    col_widths = [0.13, 0.26, 0.13, 0.13, 0.18, 0.17]
-    rows: list[list[str]] = []
-    wtg_ant = None
+    rotulos, cats = [], []
     for _, r in df.iterrows():
-        wtg = str(r["WTG"])
-        mostra_wtg = wtg if wtg != wtg_ant else ""
-        rows.append([
-            mostra_wtg,
-            str(r["COMPONENTE"]),
-            _fmt_temp(r["PICO"]),
-            _fmt_temp(r["MEDIA"]),
-            _fmt_limite(r.get("DERATE"), r.get("DOWNTIME")),
-            _status_label(int(r["SEV"])),
-        ])
-        wtg_ant = wtg
+        rot, cat = _classificar(frota_key, str(r["VARIABLE"]))
+        rotulos.append(rot); cats.append(cat)
+    df["ROTULO"] = rotulos
+    df["CATEGORIA"] = cats
+    df["ORD"] = df["ROTULO"].map(_ordem)
 
-    add_tabela(
-        doc,
-        headers=headers,
-        rows=rows,
-        col_widths_pct=col_widths,
-        col_status=5,          # coluna Status recebe cor automática
-        first_col_bold=True,
-        titulo=f"Top {n_wtgs} WTGs com maiores temperaturas — {periodo_str}",
-    )
+    criticos = df[df["CATEGORIA"] == "CRITICO"].copy()
+    auxiliares = df[df["CATEGORIA"] == "AUX"].copy()
 
-    # ----- Nota metodológica -----
-    _rodape_metodologia(doc)
+    if not criticos.empty:
+        rank = (criticos.assign(_c=(criticos["SEV"]==2).astype(int))
+                .groupby("WTG").agg(n_crit=("_c","sum"), pico_max=("PICO","max"))
+                .reset_index().sort_values(["n_crit","pico_max"], ascending=[False,False]))
+        rank = rank.head(7)
+        grupos = []
+        for wtg in rank["WTG"]:
+            sub = criticos[criticos["WTG"]==wtg].sort_values(["ORD","PICO"], ascending=[True,False])
+            pico_max = float(sub["PICO"].max())
+            linhas = []
+            for _,r in sub.iterrows():
+                media = fmt_float(float(r["MEDIA"]))+" °C" if pd.notna(r["MEDIA"]) else "—"
+                der = int(r["DERATE"]) if pd.notna(r["DERATE"]) else "·"
+                dow = int(r["DOWNTIME"]) if pd.notna(r["DOWNTIME"]) else "·"
+                linhas.append([
+                    str(r["ROTULO"]),
+                    fmt_float(float(r["PICO"]))+" °C",
+                    media,
+                    f"{der}/{dow} °C",
+                    _sev_txt(r["SEV"]),
+                ])
+            grupos.append({"wtg":wtg, "h_total":pico_max, "linhas":linhas})
+        add_tabela_hierarquica_temp(
+            doc, grupos,
+            headers=["Componente","Pico","Média (7d)","Limites \u26a0/\u26d4","Severidade"],
+            col_widths_pct=[0.30,0.15,0.16,0.20,0.19],
+            col_status=4,
+            titulo=f"Top {len(rank)} aerogeradores por severidade térmica — componentes críticos")
+    else:
+        add_paragrafo(doc, "Nenhum componente crítico acima dos limites no período.",
+            size=10, color=HEX_CINZA_CLARO)
 
+    if not auxiliares.empty:
+        n_aux = len(auxiliares)
+        n_wtg_aux = auxiliares["WTG"].nunique()
+        distintos = sorted(auxiliares["ROTULO"].unique())
+        resumo = ", ".join(distintos[:5]) + (f" +{len(distintos)-5}" if len(distintos)>5 else "")
+        add_paragrafo(doc,
+            f"Sensores auxiliares (refrigeração/ambiente) acima do limite: {n_aux} leitura(s) "
+            f"em {n_wtg_aux} WTG(s) — {resumo}. Oscilação típica desses sensores; monitorar sem criticidade.",
+            size=8, color=HEX_CINZA_CLARO, before=6)
 
-def _rodape_metodologia(doc) -> None:
-    add_banner(
-        doc,
-        "Limites oficiais por sensor (⚠ derate / ⛔ downtime): Gerador enrol. "
-        "130/135 · Gerador rolam. 90/100 · Gerador slipring 75/80 · "
-        "Gearbox rolam. 85/90 · Gearbox óleo 75/80 · Trafo enrol. 140/145 · "
-        "Nacele —/45 °C. Pico via agregação MAX; média via AVG. "
-        "Fonte: cockpit de anomalia térmica (SG).",
-        cor=HEX_AMARELO,
-    )
+    add_banner(doc, "Picos acima do limite de downtime (\u26d4) nos componentes de desgaste indicam risco de "
+        "derate/parada. Recomenda-se inspeção do sistema de refrigeração e dos componentes nas WTGs críticas.",
+        cor="F59E0B")
+    quebra_pagina(doc)
