@@ -13,6 +13,13 @@ CORAL="#FF5246"; CORAL_ESCURO="#D23532"; GRAFITE="#4B4B4B"; GRAFITE_ESC="#181818
 VERDE="#32CAA0"; AMARELO="#F59E0B"; CINZA="#9CA3AF"; CINZA_BORDA="#E5E3E0"
 AREIA="#EDE9E5"; BRANCO="#FFFFFF"
 
+
+def _rotular_periodo(s):
+    """Rótulo do eixo x. Aceita int (vira 'S36') ou str (usa como veio,
+    ex.: 'Últimos 7d'). Permite misturar semanas SG e janela móvel."""
+    return s if isinstance(s, str) else f"S{s:02d}"
+
+
 COR_SUBSISTEMA = {
     "GENERATOR":CORAL,"HYDRAULICS":GRAFITE,"CONVERTER":AMARELO,"FREQUENCY CONVERTER":AMARELO,
     "BRAKE":CINZA,"GEARBOX":CORAL_ESCURO,"PITCH SYSTEM":VERDE,"POWER ELECTRICAL":GRAFITE_ESC,
@@ -37,7 +44,7 @@ def grafico_disponibilidade(semanas, valores, meta=98.0,
         out_path=str(Path(tempfile.gettempdir())/"g_disp.png"),
         titulo="Evolução semanal — disponibilidade vs. meta"):
     fig, ax = plt.subplots(figsize=(8.5,3.4), dpi=170); fig.patch.set_facecolor(BRANCO)
-    labels=[f"S{s:02d}" for s in semanas]; x=list(range(len(semanas)))
+    labels=[_rotular_periodo(s) for s in semanas]; x=list(range(len(semanas)))
     ax.axhline(meta, color=CINZA, linewidth=1.3, linestyle=(0,(6,4)), zorder=1)
     ax.plot(x, valores, color=CORAL, linewidth=2.6, marker="o", markersize=7.5,
             markerfacecolor=CORAL, markeredgecolor=BRANCO, markeredgewidth=1.4, zorder=3)
@@ -90,7 +97,7 @@ def grafico_taxas_3series(semanas, falha, corr_np, corr_p, grande_corr=None,
     for s in ("top","right","left"): ax.spines[s].set_visible(False)
     ax.spines["bottom"].set_color(CINZA_BORDA)
     ax.tick_params(colors=GRAFITE, labelsize=9, length=0)
-    ax.set_xticks(x); ax.set_xticklabels([f"S{s:02d}" for s in semanas], fontsize=10.5, color=GRAFITE)
+    ax.set_xticks(x); ax.set_xticklabels([_rotular_periodo(s) for s in semanas], fontsize=10.5, color=GRAFITE)
     ax.grid(axis="y", color=CINZA_BORDA, linewidth=0.8, alpha=0.6); ax.set_axisbelow(True)
     ax.set_ylabel("% de horas-frota", color=GRAFITE, fontsize=9, fontfamily=FONTE_CORPO)
     ax.set_ylim(0, vmax*1.20)

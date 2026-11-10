@@ -1,20 +1,16 @@
 """Parser do CSV/XLS de warnings do SCADA do fabricante.
 
-Reconhece automaticamente dois formatos (pelas colunas presentes) e normaliza
-os dois para o mesmo schema interno antes de seguir com o ranking:
+Reconhece automaticamente os formatos (pelas colunas presentes) e normaliza
+para o mesmo schema interno antes do ranking:
 
-- Siemens Gamesa (SG): Usina elétrica, Dispositivo, Categoria, Evento,
-  Subevento/Categorização, Data de início, Data Final, Duração, Descrição.
+- Siemens Gamesa (SG): Usina eletrica, Dispositivo, Categoria, Evento,
+  Subevento/Categorizacao, Data de inicio, Data Final, Duracao, Descricao.
   Categorias: 'Estado' (descartado), 'Aviso', 'Alarme'.
+  ** O export pode vir em INGLES ** (Power Plant, Device, Category, Event,
+  Start Date...). Nesse caso, _traduzir_cabecalhos() converte os nomes e as
+  categorias (State/Warning/Alarm -> Estado/Aviso/Alarme) antes de tudo.
 
-- Vestas (VE): Unit, Serial no., Code, Description, Detected, Device ack.,
-  Reset/Run, Duration, Event type, Severity, Remark, New value.
-  Já vem só como warning ('Warning log (W)'); não há distinção Aviso/Alarme
-  nesse export -- tudo entra como 'Aviso'. A duração é calculada pela
-  diferença entre 'Detected' e 'Device ack.' (não vem pronta na planilha).
-  O código da unidade (ex. AS406_08) é convertido para o formato de exibição
-  do relatório (ex. AS4-VI-08): AS4{circuito 2 dig.}_{posicao 2 dig.} ->
-  AS4-{circuito em romano}-{posicao}.
+- Vestas (VE): Unit, Serial no., Code, Description, Detected, Device ack., ...
 """
 from __future__ import annotations
 import re
@@ -31,6 +27,45 @@ except Exception:
 _ROMANOS = {1:"I",2:"II",3:"III",4:"IV",5:"V",6:"VI",7:"VII",8:"VIII",9:"IX",10:"X",
             11:"XI",12:"XII",13:"XIII",14:"XIV",15:"XV"}
 
+# --- Tradução de cabeçalhos EN -> PT (formato SG exportado em inglês) --------
+# Mapeia pelo nome exato (após strip). Só afeta o export SG em inglês; o
+# formato Vestas e o SG já em português passam intactos (nenhuma chave bate,
+# ou já estão em PT).
+_CABECALHOS_EN_PT = {
+    "Power Plant": "Usina elétrica",
+    "Device": "Dispositivo",
+    "Category": "Categoria",
+    "Event": "Evento",
+    "Subevent / Categorization": "Subevento / Categorização",
+    "Start Date": "Data de início",
+    "End Date": "Data Final",
+    "Duration": "Duração",
+    "Categorization description": "Descrição",
+}
+_CATEGORIAS_EN_PT = {
+    "State": "Estado", "Warning": "Aviso", "Alarm": "Alarme",
+    # já em PT (idempotente)
+    "Estado": "Estado", "Aviso": "Aviso", "Alarme": "Alarme",
+}
+
+
+def _traduzir_cabecalhos(df: pd.DataFrame) -> pd.DataFrame:
+    """Se o CSV veio em inglês (formato SG), converte nomes de coluna e a
+    coluna Categoria para português. Não toca no formato Vestas (colunas
+    diferentes) nem no SG que já veio em português."""
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+    # traduz nomes de coluna que casam com o mapa EN->PT
+    renomear = {c: _CABECALHOS_EN_PT[c] for c in df.columns if c in _CABECALHOS_EN_PT}
+    if renomear:
+        df = df.rename(columns=renomear)
+    # traduz valores da coluna Categoria (State/Warning/Alarm -> PT)
+    if "Categoria" in df.columns:
+        df["Categoria"] = df["Categoria"].map(
+            lambda x: _CATEGORIAS_EN_PT.get(str(x).strip(), str(x).strip()))
+    return df
+
+
 def _ler(path: str) -> pd.DataFrame:
     p = Path(path)
     if p.suffix.lower() in (".xlsx", ".xls"):
@@ -38,19 +73,13 @@ def _ler(path: str) -> pd.DataFrame:
     for sep in (";", ","):
         try:
             df = pd.read_csv(p, sep=sep, encoding="utf-8-sig")
-            if df.shape[1] >= 6: return df
+            if df.shape[1] >= 6:
+                return df
         except Exception:
             pass
     return pd.read_csv(p, sep=";", encoding="utf-8-sig")
 
 def _split_codigo(evento: str):
-    """'233 [Br]Low level...' -> ('233', 'LOW LEVEL...').
-
-    Prioridade do nome (nunca traduz; usa nomenclatura oficial em ingles):
-      1. mapa oficial do banco (por codigo)
-      2. texto [Br] do proprio CSV (ja em ingles)
-      3. texto do CSV como veio (fallback)
-    """
     s = str(evento).strip()
     m = re.match(r"^(\d+)\s+(.*)$", s)
     if not m:
@@ -64,7 +93,6 @@ def _split_codigo(evento: str):
     return cod, resto.strip()
 
 def _unit_vestas_para_exibicao(unit: str) -> str:
-    """'AS406_08' -> 'AS4-VI-08'. Se nao bater o padrao, devolve como veio."""
     m = re.match(r"^AS4(\d{2})_(\d{2})$", str(unit).strip())
     if not m:
         return str(unit).strip()
@@ -101,14 +129,6 @@ def _normalizar_sg(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _normalizar_vestas(df: pd.DataFrame) -> pd.DataFrame:
-    """Formato Vestas -> schema interno comum.
-
-    Nao ha distincao Aviso/Alarme neste export (tudo e 'Warning log (W)'),
-    entao tudo entra como categoria 'Aviso'. Duracao = Device ack. - Detected
-    (calculada; nao vem pronta). O codigo do evento vem de 'Code' e a
-    descricao de 'Description'; remontamos "COD DESCRICAO" para reaproveitar
-    o mesmo _split_codigo usado no formato SG.
-    """
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
 
@@ -130,6 +150,7 @@ def _normalizar_vestas(df: pd.DataFrame) -> pd.DataFrame:
 
 def processar_warnings(path: str, data_ini=None, data_fim=None, top_n: int = 10) -> dict:
     df_bruto = _ler(path)
+    df_bruto = _traduzir_cabecalhos(df_bruto)   # <<< EN->PT se necessário
     formato = _detectar_formato(df_bruto)
     df = _normalizar_sg(df_bruto) if formato == "SG" else _normalizar_vestas(df_bruto)
 

@@ -1,9 +1,7 @@
-"""Página 2 — 01. Disponibilidade Fabricante.
+"""Pagina 2 - 01. Disponibilidade Fabricante.
 
-Conteúdo:
-  - 4 KPI cards: Disp S{atual}, S{-1}, S{-2}, Pior semana
-  - Gráfico de linha com meta 98% tracejada
-  - Tabela histórica (Semana, Disp, Meta, Gap, Situação)
+A coluna SEM agora e TEXTO (ex.: "S38" ou "Ultimos 7d"), vinda do periodo.
+A ordem das colunas vem da coluna ORD (1..4). A ultima (maior ORD) e o foco.
 """
 from __future__ import annotations
 
@@ -34,103 +32,87 @@ def _fmt_gap(gap: float) -> str:
     return f"{seta} {n} p.p."
 
 
-def _situacao_semana(disp: float, disp_min: float, disp_max: float,
-                       meta: float) -> str:
-    """Classifica a semana de forma relativa ao período + à meta."""
+def _situacao_semana(disp: float, disp_min: float, disp_max: float, meta: float) -> str:
     if disp >= meta:
         return "Acima da meta"
-    # dentro do período (sem atingir meta), destaca melhor e pior
     if abs(disp - disp_max) < 0.005:
-        return "Melhor semana do período"
+        return "Melhor período"
     if abs(disp - disp_min) < 0.005:
-        return "Pior semana do período"
+        return "Pior período"
     return "Abaixo da meta"
 
 
 def construir_pg2(doc: DocumentT, df: pd.DataFrame) -> None:
-    """df vem da query 'disponibilidade_semanal' com colunas:
-    SEM, INI, FIM, HORAS_PARADA, DISP_PCT, GAP_PP."""
+    """df da query 'disponibilidade_semanal': ORD, SEM (texto), INI, FIM,
+    TX_*, DISP_PCT, GAP_PP, HORAS_PARADA."""
     add_capitulo(
-        doc,
-        numero="01",
-        titulo="Disponibilidade Fabricante",
-        subtitulo=("Responsabilidade SG · descontando eventos sob responsabilidade Serena · "
+        doc, numero="01", titulo="Disponibilidade Fabricante",
+        subtitulo=("Responsabilidade OEM · descontando eventos sob responsabilidade Serena · "
                    "Meta contratual: 98,00%"),
     )
 
     if df is None or df.empty:
         from utils.docx_helpers import add_paragrafo
-        add_paragrafo(doc, "Dados indisponíveis para esta semana.",
-                       size=10, color=HEX_CINZA_CLARO)
+        add_paragrafo(doc, "Dados indisponíveis para este período.", size=10, color=HEX_CINZA_CLARO)
         quebra_pagina(doc)
         return
 
-    df = df.sort_values("SEM").reset_index(drop=True)
-    # Identifica pior semana
-    pior_idx = df["DISP_PCT"].idxmin()
-    pior_sem = int(df.loc[pior_idx, "SEM"])
-    pior_v   = float(df.loc[pior_idx, "DISP_PCT"])
+    # ordena pela coluna ORD (fallback: mantém ordem recebida)
+    if "ORD" in df.columns:
+        df = df.sort_values("ORD").reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
 
-    # 4 KPI cards: as 3 últimas semanas + pior semana
+    def _rot(row) -> str:
+        return str(row["SEM"])   # já é "S38" ou "Últimos 7d"
+
+    disp_vals = [float(r["DISP_PCT"]) for _, r in df.iterrows()]
+    disp_min, disp_max = min(disp_vals), max(disp_vals)
+
+    pior_idx = df["DISP_PCT"].astype(float).idxmin()
+    pior_rot = _rot(df.loc[pior_idx])
+    pior_v = float(df.loc[pior_idx, "DISP_PCT"])
+
+    # 3 primeiros cards = as 3 primeiras colunas; 4º card = a coluna em foco (última)
     cards = []
-    for i in range(-3, 0):  # -3, -2, -1 (mais recente)
-        if abs(i) <= len(df):
-            row = df.iloc[i]
-            sem = int(row["SEM"])
-            disp = float(row["DISP_PCT"])
-            gap = float(row["GAP_PP"])
-            sub = _fmt_gap(gap) + (" abaixo da meta" if gap < 0 else " acima da meta")
-            cards.append({
-                "label": f"Disponibilidade S{sem:02d}",
-                "valor": fmt_pct(disp),
-                "sub":   sub,
-                "cor_rgb": RGB_CORAL,
-            })
-
-    pior_gap_abs = abs(float(df.loc[pior_idx, "GAP_PP"]))
-    pior_gap_str = f"{pior_gap_abs:.2f}".replace(".", ",")
+    for i in range(min(3, len(df))):
+        row = df.iloc[i]
+        disp = float(row["DISP_PCT"]); gap = float(row["GAP_PP"])
+        sub = _fmt_gap(gap) + (" abaixo da meta" if gap < 0 else " acima da meta")
+        cards.append({"label": f"Disponibilidade {_rot(row)}", "valor": fmt_pct(disp),
+                      "sub": sub, "cor_rgb": RGB_CORAL})
+    # 4º card: a coluna em foco (a última do df)
+    foco = df.iloc[-1]
+    disp_f = float(foco["DISP_PCT"]); gap_f = float(foco["GAP_PP"])
     cards.append({
-        "label": f"Pior semana S{int(df.iloc[0]['SEM']):02d}-S{int(df.iloc[-1]['SEM']):02d}",
-        "valor": fmt_pct(pior_v),
-        "sub":   f"Gap máx: -{pior_gap_str} p.p. (S{pior_sem:02d})",
+        "label": f"Disponibilidade {_rot(foco)}",
+        "valor": fmt_pct(disp_f),
+        "sub": _fmt_gap(gap_f) + (" abaixo da meta" if gap_f < 0 else " acima da meta"),
         "cor_rgb": RGB_CORAL,
     })
     add_kpi_cards(doc, cards)
 
-    # Gráfico de linha
+    # Gráfico de linha — passa rótulos-texto
+    labels = [_rot(r) for _, r in df.iterrows()]
     img_path = Path(tempfile.gettempdir()) / "g_disp.png"
     grafico_disponibilidade(
-        semanas=df["SEM"].astype(int).tolist(),
+        semanas=labels,
         valores=df["DISP_PCT"].astype(float).tolist(),
-        meta=META,
-        out_path=img_path,
+        meta=META, out_path=img_path,
     )
     add_imagem(doc, str(img_path), largura_cm=16.5)
 
     # Tabela histórica
-    disp_vals = [float(r["DISP_PCT"]) for _, r in df.iterrows()]
-    disp_min, disp_max = min(disp_vals), max(disp_vals)
     rows = []
     for _, r in df.iterrows():
-        sem = int(r["SEM"])
-        disp = float(r["DISP_PCT"])
-        gap = float(r["GAP_PP"])
-        rows.append([
-            f"S{sem:02d}",
-            fmt_pct(disp),
-            fmt_pct(META),
-            _fmt_gap(gap),
-            _situacao_semana(disp, disp_min, disp_max, META),
-        ])
-
+        disp = float(r["DISP_PCT"]); gap = float(r["GAP_PP"])
+        rows.append([_rot(r), fmt_pct(disp), fmt_pct(META), _fmt_gap(gap),
+                     _situacao_semana(disp, disp_min, disp_max, META)])
     add_tabela(
         doc,
-        headers=["Semana", "Disponibilidade", "Meta", "Gap vs. Meta", "Situação"],
-        rows=rows,
-        col_widths_pct=[0.13, 0.20, 0.15, 0.18, 0.34],
-        col_status=4,
-        first_col_bold=True,
-        titulo=f"Evolução histórica — S{int(df.iloc[0]['SEM']):02d} a S{int(df.iloc[-1]['SEM']):02d}",
+        headers=["Período", "Disponibilidade", "Meta", "Gap vs. Meta", "Situação"],
+        rows=rows, col_widths_pct=[0.16, 0.20, 0.15, 0.18, 0.31],
+        col_status=4, first_col_bold=True,
+        titulo=f"Evolução — {labels[0]} a {labels[-1]}",
     )
-
     quebra_pagina(doc)

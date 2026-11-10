@@ -8,6 +8,9 @@ taxas de falha/corretiva, MTBF e análise de temperatura, seguindo a identidade
 visual da Serena.
 
 ---
+python gerar_fleet_report.py 7d 2026 SG            # últimos 7 dias (termina ontem)
+python gerar_fleet_report.py 15d 2026 SG           # últimos 15 dias (termina ontem)
+python gerar_fleet_report.py s38 2026 SG           # semana SG fixa (clássico)
 
 ## Estrutura das páginas
 

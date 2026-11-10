@@ -1,11 +1,20 @@
 """Orquestrador — Fleet Reliability Report SRNA.
 
-Uso: python gerar_fleet_report.py <semana> <ano> <frota> [csv_warnings]
-Ex:  python gerar_fleet_report.py 28 2026 SG C:\\caminho\\AWS.csv
-     python gerar_fleet_report.py 29-30 2026 VE   (janela quinzenal)
+Uso: python gerar_fleet_report.py <modo> <ano> <frota> [csv_warnings]
 
-Executa as 7 queries direto no Snowflake via SSO (data/connection.py) e monta
-o .docx com a identidade Serena.
+  <modo>:
+    7d       -> janela movel: ultimos 7 dias (terminando ONTEM)
+    15d      -> janela movel: ultimos 15 dias (terminando ONTEM)
+    sNN / NN -> semana SG fixa NN (sabado-sexta), comportamento classico
+    NN-MM    -> intervalo de semanas SG (ex.: quinzenal Vestas)
+
+Ex:  python gerar_fleet_report.py 7d 2026 SG C:\\caminho\\AWS.csv
+     python gerar_fleet_report.py s38 2026 SG
+     python gerar_fleet_report.py 29-30 2026 VE
+
+Nos modos moveis (7d/15d), a pagina 1 mostra as 3 ultimas semanas SG fechadas
++ a janela movel; as secoes 2-5 usam a janela movel. No modo semana, tudo
+segue a semana SG informada (comportamento anterior).
 """
 from __future__ import annotations
 import sys
@@ -15,11 +24,11 @@ from docx import Document
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config.settings import FROTAS, resolver_frota, META_DISP
-from utils.semana_sg import janela_da_semana
+from utils.periodo import resolver_periodo
 from utils.fonts import registrar_fontes
 from utils.docx_helpers import configurar_pagina, add_capa, add_quebra_para_conteudo
 from utils.logger import get_logger
-from data.connection import run_query          # <<< SUA conexão SSO (não sobe ao GitHub)
+from data.connection import run_query
 from data.queries import QUERIES
 from data.warnings_parser import processar_warnings
 from secoes.pg2_disponibilidade import construir_pg2
@@ -30,78 +39,72 @@ from secoes.pg6_warnings import construir_pg6
 
 log = get_logger("fleet.orquestrador")
 
-# Ajuste este caminho para a pasta de saída da sua máquina:
 OUT_DIR_PADRAO = r"C:\Users\abraão.lodi\OneDrive - Serena\Área de Trabalho\Downloads\dev\fleet_report_srna_v3\output"
 
 
-def _filtro_exclusao(frota) -> str:
-    """Monta a cláusula AND ... NOT IN (...) de exclusão de alarme (só GE tem)."""
-    if not frota.exclusao_alarmes:
-        return ""
-    lista = ",".join("'" + a.replace("'", "''") + "'" for a in frota.exclusao_alarmes)
-    return f"AND n.EVENT_NAME NOT IN ({lista})"
+def _colunas_sql(periodo) -> str:
+    """Monta as linhas de VALUES para a query de disponibilidade a partir das
+    4 colunas do periodo (3 SG + movel, ou 4 SG). fim_excl = dia seguinte ao
+    ultimo dia contado (00:00), pois o clip usa fim exclusivo."""
+    linhas = []
+    for i, col in enumerate(periodo.historico, start=1):
+        rot = col.rotulo.replace("'", "''")
+        fim_excl = (col.fim + timedelta(days=1)).isoformat()
+        linhas.append(
+            f"({i}, '{rot}', '{col.ini.isoformat()}'::TIMESTAMP_NTZ, "
+            f"'{fim_excl}'::TIMESTAMP_NTZ)")
+    return ",\n        ".join(linhas)
 
 
-def gerar(semana:int, ano:int, frota_key:str, csv_warnings:str|None=None,
-          out_dir=OUT_DIR_PADRAO, semana_fim:int|None=None) -> str:
-    """Gera o relatório. Para janela de uma semana, passe só `semana`.
-    Para janela de múltiplas semanas (ex.: Vestas quinzenal S29-S30), passe
-    `semana` (início) e `semana_fim` (fim)."""
+def gerar(modo: str, ano: int, frota_key: str, csv_warnings: str | None = None,
+          out_dir=OUT_DIR_PADRAO) -> str:
     registrar_fontes()
     frota = FROTAS[frota_key]
-    jan = janela_da_semana(semana, ano)
-    jan_fim = janela_da_semana(semana_fim, ano) if semana_fim else jan
-    periodo = f"{jan.inicio.strftime('%d/%m')} a {jan_fim.fim.strftime('%d/%m/%Y')}"
-    if semana_fim and semana_fim != semana:
-        rotulo_sem = f"S{semana:02d}-S{semana_fim:02d}"
-    else:
-        rotulo_sem = f"S{semana:02d}"
-    log.info(f"Gerando relatório {rotulo_sem}/{ano} — {frota.cluster_oem} ({periodo})")
+    per = resolver_periodo(modo, ano)
 
-    # janela de temperatura: últimos 7 dias
+    periodo_txt = f"{per.foco_ini:%d/%m} a {per.foco_fim:%d/%m/%Y}"
+    rotulo = per.rotulo_foco
+    log.info(f"Gerando relatório [{rotulo}] {ano} — {frota.cluster_oem} ({periodo_txt})")
+
+    # janela das secoes 2-5 (foco). fim exclusivo = dia seguinte 00:00.
+    janela_ini = per.foco_ini.isoformat()
+    janela_fim = (per.foco_fim + timedelta(days=1)).isoformat()
+
+    # temperatura: sempre ultimos 7 dias terminando ontem (janela propria)
     temp_fim = date.today() - timedelta(days=1)
     temp_ini = temp_fim - timedelta(days=6)
-    periodo_temp = f"{temp_ini.strftime('%d/%m')}–{temp_fim.strftime('%d/%m')}"
-    # janela de warnings: 2 semanas (semana atual + anterior)
-    jan_ant = janela_da_semana(semana-1, ano)
-    periodo_warn = f"S{semana-1:02d}–S{semana:02d} ({jan_ant.inicio.strftime('%d/%m')}–{jan.fim.strftime('%d/%m')})"
+    periodo_temp = f"{temp_ini:%d/%m}–{temp_fim:%d/%m}"
 
-    # ------------------------------------------------------------------
-    # EXECUÇÃO DAS QUERIES — direto no Snowflake via SSO (run_query)
-    # ------------------------------------------------------------------
-    # 1) nº de WTGs nominal da frota (denominador da disponibilidade)
+    # warnings: 2 semanas ate o fim do foco
+    warn_ini = per.foco_fim - timedelta(days=13)
+    periodo_warn = f"{warn_ini:%d/%m}–{per.foco_fim:%d/%m}"
+
+    # nº de WTGs (denominador)
     df_wtgs = run_query(QUERIES["contagem_wtgs"], {"cluster": frota.cluster_oem})
     n_wtgs = int(df_wtgs["N_WTGS"].iloc[0])
 
-    # parâmetros comuns a todas as queries (janela final = jan_fim para intervalos)
     params = {
-        "cluster":   frota.cluster_oem,
-        "n_wtgs":    n_wtgs,
-        "sem_atual": semana,
-        "sem_fim":   semana_fim if semana_fim else semana,
-        "sab_atual": jan.inicio.isoformat(),
-        "sab_fim":   jan_fim.inicio.isoformat(),
-        "data_ini":  temp_ini.isoformat(),
-        "data_fim":  temp_fim.isoformat(),
+        "cluster":     frota.cluster_oem,
+        "n_wtgs":      n_wtgs,
+        "colunas_sql": _colunas_sql(per),   # <<< novo: 4 colunas da pg 1
+        "janela_ini":  janela_ini,          # <<< novo: foco das secoes 2-5
+        "janela_fim":  janela_fim,
+        "data_ini":    temp_ini.isoformat(),
+        "data_fim":    temp_fim.isoformat(),
     }
 
-    excl = _filtro_exclusao(frota)
-
-    # helper: injeta {FILTRO_EXCLUSAO} (não é %(nome)s) e roda a query
     def q(chave):
-        frota = FROTAS[frota_key]
-        # cláusula por EVENT_NAME (mtbf) — a que você já tinha
         excl = ""
-        if frota.exclusao_alarmes:
-            lista = ",".join("'" + a.replace("'", "''") + "'" for a in frota.exclusao_alarmes)
-            excl = f"AND n.EVENT_NAME NOT IN ({lista})"
-        # cláusula por evento_parada (taxas de falha) — a nova
         excl_evt = ""
         if frota.exclusao_alarmes:
             lista = ",".join("'" + a.replace("'", "''") + "'" for a in frota.exclusao_alarmes)
+            excl = f"AND n.EVENT_NAME NOT IN ({lista})"
             excl_evt = f"AND v.evento_parada NOT IN ({lista})"
-
-        sql = QUERIES[chave].replace("{FILTRO_EXCLUSAO}", excl)
+        sql = QUERIES[chave]
+        # colunas_sql precisa ir SEM aspas (é fragmento SQL), então substitui à parte
+        if "%(colunas_sql)s" in sql:
+            sql = sql.replace("%(colunas_sql)s", params["colunas_sql"])
+        sql = sql.replace("{FILTRO_EXCLUSAO}", excl)
         sql = sql.replace("{FILTRO_EXCLUSAO_EVT}", excl_evt)
         return run_query(sql, params)
 
@@ -112,22 +115,18 @@ def gerar(semana:int, ano:int, frota_key:str, csv_warnings:str|None=None,
     df_corr   = q("maiores_tempos_corretiva")
     df_temp   = q("temperatura_top5")
 
-    # garante nomes de coluna em MAIÚSCULAS (as seções esperam assim)
     for _df in (df_disp, df_alarm, df_mtbf, df_falha, df_corr, df_temp):
         if _df is not None and not _df.empty:
             _df.columns = [str(c).upper() for c in _df.columns]
 
     warn = None
     if csv_warnings and Path(csv_warnings).exists():
-        warn = processar_warnings(csv_warnings, jan_ant.inicio, jan.fim, top_n=10)
+        warn = processar_warnings(csv_warnings, warn_ini, per.foco_fim, top_n=10)
 
-    # ------------------------------------------------------------------
-    # MONTAGEM DO DOCUMENTO
-    # ------------------------------------------------------------------
     doc = Document()
     configurar_pagina(doc)
-    add_capa(doc, semana, ano, periodo, frota.titulo_capa, frota.sub_capa, rotulo_semana=rotulo_sem)
-    add_quebra_para_conteudo(doc, semana, ano, frota.label_header, rotulo_semana=rotulo_sem)
+    add_capa(doc, rotulo, ano, periodo_txt, frota.titulo_capa, frota.sub_capa, rotulo_semana=rotulo)
+    add_quebra_para_conteudo(doc, rotulo, ano, frota.label_header, rotulo_semana=rotulo)
 
     construir_pg2(doc, df_disp)
     construir_pg3(doc, df_disp, df_alarm)
@@ -136,7 +135,6 @@ def gerar(semana:int, ano:int, frota_key:str, csv_warnings:str|None=None,
     if warn:
         construir_pg6(doc, warn, periodo_warn)
 
-    # Remove quebra de página órfã no fim (última seção deixa um parágrafo vazio)
     while len(doc.paragraphs) > 0:
         ult = doc.paragraphs[-1]
         tem_break = ult._p.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}br')
@@ -146,22 +144,16 @@ def gerar(semana:int, ano:int, frota_key:str, csv_warnings:str|None=None,
             break
 
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-    _rot_arq = f"S{semana:02d}-S{semana_fim:02d}" if (semana_fim and semana_fim != semana) else f"S{semana:02d}"
-    nome = f"Fleet_Report_{_rot_arq}_{ano}_{frota_key}.docx"
-    caminho = str(Path(out_dir)/nome)
+    nome = f"Fleet_Report_{per.rotulo_arquivo}_{ano}_{frota_key}.docx"
+    caminho = str(Path(out_dir) / nome)
     doc.save(caminho)
     log.info(f"Salvo: {caminho}")
     return caminho
 
 
 if __name__ == "__main__":
-    # semana pode ser "29" (uma semana) ou "29-30" (intervalo)
-    arg_sem = sys.argv[1]
-    if "-" in arg_sem:
-        semana, semana_fim = (int(p) for p in arg_sem.split("-", 1))
-    else:
-        semana, semana_fim = int(arg_sem), None
+    modo = sys.argv[1]                       # "7d" | "15d" | "s38" | "38" | "29-30"
     ano = int(sys.argv[2])
     frota_key = resolver_frota(sys.argv[3]) if len(sys.argv) > 3 else "SG"
     csv = sys.argv[4] if len(sys.argv) > 4 else None
-    print(gerar(semana, ano, frota_key, csv, semana_fim=semana_fim))
+    print(gerar(modo, ano, frota_key, csv))

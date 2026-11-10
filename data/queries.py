@@ -1,61 +1,56 @@
-"""Catálogo de queries SQL parametrizadas — Fleet Reliability Report SRNA.
+"""Catalogo de queries SQL parametrizadas - Fleet Reliability Report SRNA.
 
 FONTE: OEM_PROD.AVAILABILITY.F_REAL_EOL_WTG_EVENTLOG_VALIDATED_ALERTS
 
-DIFERENÇAS CRÍTICAS vs. a _DAY (motivo destas correções):
-  1. Eventos em aberto têm DATA_FIM = NULL → todo LEAST(data_fim, ...) precisa de
-     COALESCE(data_fim, <limite>) senão o DATEDIFF vira NULL e o Python quebra
-     (TypeError: float() argument ... not 'NoneType').
-  2. A coluna `data` é uma linha por evento (não linha-por-dia). O filtro de janela
-     deve ser por OVERLAP de timestamp (data_inicio < fim_janela AND
-     COALESCE(data_fim, limite) > ini_janela), não por `data BETWEEN`.
+MODOS DE JANELA (resolvidos em utils/periodo.py):
+  - As secoes 2-5 usam uma janela [janela_ini, janela_fim] (datas explicitas),
+    que pode ser uma semana SG fechada OU os ultimos 7/15 dias.
+  - A disponibilidade (pg 1) recebe as 4 colunas ja montadas como linhas
+    (rotulo + ini + fim) via o parametro %(colunas_sql)s.
 
-Tratamento de evento aberto (Opção B): conta horas até o FIM DA JANELA da semana.
-  → limite = DATEADD(day,1,s.fim) na disponibilidade; j.fim nas demais.
-  Para contar até AGORA (Opção A), troque o limite por CURRENT_TIMESTAMP().
+TRATAMENTO DE EVENTO ABERTO:
+  - Evento com data_fim conhecido (mesmo futuro) -> conta ate o fim real,
+    limitado ao fim da coluna/janela.
+  - Evento com data_fim = NULL (orfao) -> conta ate CURRENT_TIMESTAMP,
+    limitado ao fim da coluna/janela.
 
-Parâmetros:
-  %(cluster)s, %(n_wtgs)s, %(sem_fim)s, %(sab_fim)s, %(sab_atual)s,
-  %(data_ini)s, %(data_fim)s, {FILTRO_EXCLUSAO}
+Parametros:
+  %(cluster)s, %(n_wtgs)s, %(colunas_sql)s (disponibilidade),
+  %(janela_ini)s, %(janela_fim)s (secoes 2-5),
+  %(data_ini)s, %(data_fim)s (temperatura),
+  {FILTRO_EXCLUSAO}, {FILTRO_EXCLUSAO_EVT}
 """
 from __future__ import annotations
 
-# nº de WTGs da frota, direto do banco
 Q_CONTAGEM_WTGS = """
 SELECT COUNT(DISTINCT wtg) AS n_wtgs
 FROM OEM_PROD.AVAILABILITY.F_REAL_EOL_WTG_EVENTLOG_VALIDATED_ALERTS
 WHERE cluster_oem = %(cluster)s;
 """
 
-# Pg 2 — Disponibilidade + 4 taxas (4 semanas SG)
 Q_DISPONIBILIDADE_SEMANAL = """
-WITH semanas AS (
-    SELECT sem_num AS sem,
-        DATEADD(week, sem_num - %(sem_fim)s, %(sab_fim)s::DATE) AS ini,
-        DATEADD(day, 6, DATEADD(week, sem_num - %(sem_fim)s, %(sab_fim)s::DATE)) AS fim
-    FROM (
-        SELECT %(sem_fim)s - 3 AS sem_num UNION ALL SELECT %(sem_fim)s - 2
-        UNION ALL SELECT %(sem_fim)s - 1 UNION ALL SELECT %(sem_fim)s
-    )
+WITH colunas AS (
+    SELECT * FROM ( VALUES
+        %(colunas_sql)s
+    ) AS c(ord, rotulo, ini, fim_excl)
 ),
 base AS (
-    SELECT s.sem, s.ini, s.fim, v.motivo_parada,
+    SELECT c.ord, c.rotulo, c.ini, c.fim_excl, v.motivo_parada,
         DATEDIFF('second',
-            GREATEST(v.data_inicio, s.ini::TIMESTAMP_NTZ),
-            LEAST(COALESCE(v.data_fim, DATEADD(day,1,s.fim)::TIMESTAMP_NTZ),
-                  DATEADD(day, 1, s.fim)::TIMESTAMP_NTZ)
+            GREATEST(v.data_inicio, c.ini),
+            LEAST(COALESCE(v.data_fim, CURRENT_TIMESTAMP()), c.fim_excl)
         ) AS seg
     FROM OEM_PROD.AVAILABILITY.F_REAL_EOL_WTG_EVENTLOG_VALIDATED_ALERTS v
-    JOIN semanas s
-      ON v.data_inicio < DATEADD(day,1,s.fim)::TIMESTAMP_NTZ
-     AND COALESCE(v.data_fim, DATEADD(day,1,s.fim)::TIMESTAMP_NTZ) > s.ini::TIMESTAMP_NTZ
+    JOIN colunas c
+      ON v.data_inicio < c.fim_excl
+     AND COALESCE(v.data_fim, CURRENT_TIMESTAMP()) > c.ini
     WHERE v.cluster_oem = %(cluster)s AND v.validado = 'True'
       AND v.responsabilidade IN ('Fabricante', 'Nenhum dos dois')
       AND (v.sistema_parada IS NULL OR v.sistema_parada NOT IN ('ENVIRONMENT', 'GRID CONNECTION'))
       AND (v.motivo_parada  IS NULL OR v.motivo_parada  NOT IN ('AMBIENTAL', 'CURTAILMENT'))
       {FILTRO_EXCLUSAO_EVT}
 )
-SELECT s.sem AS sem, s.ini::DATE AS ini, s.fim::DATE AS fim,
+SELECT c.ord AS ord, c.rotulo AS sem, c.ini::DATE AS ini, DATEADD(day,-1,c.fim_excl)::DATE AS fim,
     ROUND(100.0*COALESCE(SUM(CASE WHEN motivo_parada='FALHA' THEN GREATEST(seg,0) END),0)/(%(n_wtgs)s*7*24*3600),2) AS tx_falha,
     ROUND(100.0*COALESCE(SUM(CASE WHEN motivo_parada='MANUTENCAO CORRETIVA NAO PLANEJADA' THEN GREATEST(seg,0) END),0)/(%(n_wtgs)s*7*24*3600),2) AS tx_corr_np,
     ROUND(100.0*COALESCE(SUM(CASE WHEN motivo_parada='MANUTENCAO CORRETIVA PLANEJADA' THEN GREATEST(seg,0) END),0)/(%(n_wtgs)s*7*24*3600),2) AS tx_corr_p,
@@ -71,26 +66,25 @@ SELECT s.sem AS sem, s.ini::DATE AS ini, s.fim::DATE AS fim,
         - 100.0*COALESCE(SUM(CASE WHEN motivo_parada='MANUTENCAO CORRETIVA PLANEJADA' THEN GREATEST(seg,0) END),0)/(%(n_wtgs)s*7*24*3600)
         - 100.0*COALESCE(SUM(CASE WHEN motivo_parada='GRANDE CORRETIVA' THEN GREATEST(seg,0) END),0)/(%(n_wtgs)s*7*24*3600)) - 98.0, 2) AS gap_pp,
     ROUND(COALESCE(SUM(GREATEST(seg,0)),0)/3600.0, 2) AS horas_parada
-FROM semanas s
-LEFT JOIN base e ON e.sem = s.sem
-GROUP BY s.sem, s.ini, s.fim ORDER BY s.sem;
+FROM colunas c
+LEFT JOIN base e ON e.ord = c.ord
+GROUP BY c.ord, c.rotulo, c.ini, c.fim_excl ORDER BY c.ord;
 """
 
-# Pg 3 — Top 10 alarmes por horas de falha (semana atual)
 Q_TOP_ALARMES_FALHA = """
 WITH janela AS (
-    SELECT %(sab_atual)s::TIMESTAMP_NTZ AS ini, DATEADD(day,7,%(sab_fim)s)::TIMESTAMP_NTZ AS fim
+    SELECT %(janela_ini)s::TIMESTAMP_NTZ AS ini, %(janela_fim)s::TIMESTAMP_NTZ AS fim
 )
 SELECT v.evento_parada AS alarme, v.sistema_parada AS subsistema,
     COUNT(*) AS ocorrencias, COUNT(DISTINCT v.wtg) AS wtgs_afetadas,
     ROUND(COALESCE(SUM(GREATEST(DATEDIFF('second',
         GREATEST(v.data_inicio, j.ini),
-        LEAST(COALESCE(v.data_fim, j.fim), j.fim)
+        LEAST(COALESCE(v.data_fim, CURRENT_TIMESTAMP()), j.fim)
     ),0)),0)/3600.0, 2) AS horas
 FROM OEM_PROD.AVAILABILITY.F_REAL_EOL_WTG_EVENTLOG_VALIDATED_ALERTS v CROSS JOIN janela j
 WHERE v.cluster_oem = %(cluster)s AND v.validado = 'True'
   AND v.data_inicio < j.fim
-  AND COALESCE(v.data_fim, j.fim) > j.ini
+  AND COALESCE(v.data_fim, CURRENT_TIMESTAMP()) > j.ini
   AND v.motivo_parada = 'FALHA'
   AND v.responsabilidade IN ('Fabricante','Nenhum dos dois')
   AND v.sistema_parada NOT IN ('ENVIRONMENT','GRID CONNECTION')
@@ -98,7 +92,6 @@ WHERE v.cluster_oem = %(cluster)s AND v.validado = 'True'
 GROUP BY v.evento_parada, v.sistema_parada ORDER BY horas DESC LIMIT 10;
 """
 
-# Pg 4 — MTBF por WTG (inalterada: usa F_REAL_WTG_MTBF_PERIOD + NORMALIZED)
 Q_MTBF_WTG = """
 WITH d_spe_dedup AS (
     SELECT DISTINCT grupo_oem, grupo_ri, fabricante FROM OEM_PROD.DEVICES.D_ALL_SPE
@@ -110,9 +103,9 @@ mtbf_wtgs AS (
 ),
 falhas_por_periodo AS (
     SELECT n.WTG,
-        COUNT(CASE WHEN n.TIME_ON >= DATEADD(day,-7,CURRENT_DATE)::TIMESTAMP_NTZ THEN 1 END) AS n_falhas_7d,
-        ROUND(SUM(CASE WHEN n.TIME_ON >= DATEADD(day,-7,CURRENT_DATE)::TIMESTAMP_NTZ
-            THEN DATEDIFF('minute', n.TIME_ON, LEAST(COALESCE(n.TIME_OFF,CURRENT_TIMESTAMP()),CURRENT_TIMESTAMP()))/60.0 END),1) AS h_falhas_7d
+        COUNT(CASE WHEN n.TIME_ON >= %(janela_ini)s::TIMESTAMP_NTZ THEN 1 END) AS n_falhas_janela,
+        ROUND(SUM(CASE WHEN n.TIME_ON >= %(janela_ini)s::TIMESTAMP_NTZ
+            THEN DATEDIFF('minute', n.TIME_ON, LEAST(COALESCE(n.TIME_OFF,CURRENT_TIMESTAMP()),CURRENT_TIMESTAMP()))/60.0 END),1) AS h_falhas_janela
     FROM OEM_PROD.AVAILABILITY.F_REAL_EOL_WTG_EVENTLOG_NORMALIZED n
     JOIN mtbf_wtgs m ON m.wtg = n.WTG
     WHERE n.TIME_ON >= DATEADD(day,-30,CURRENT_DATE)::TIMESTAMP_NTZ
@@ -121,8 +114,8 @@ falhas_por_periodo AS (
 )
 SELECT d.grupo_ri, f.grupo_oem AS oem, d.fabricante, f.wtg, f.date AS snapshot_date,
     TRY_CAST(f.mtbf_7days AS FLOAT) AS mtbf_7d,
-    COALESCE(fp.n_falhas_7d,0) AS n_falhas_7d,
-    COALESCE(fp.h_falhas_7d,0) AS h_falhas_7d
+    COALESCE(fp.n_falhas_janela,0) AS n_falhas_7d,
+    COALESCE(fp.h_falhas_janela,0) AS h_falhas_7d
 FROM OEM_PROD.SDGM.F_REAL_WTG_MTBF_PERIOD f
 LEFT JOIN d_spe_dedup d USING (grupo_oem)
 LEFT JOIN falhas_por_periodo fp ON fp.WTG = f.wtg
@@ -131,22 +124,21 @@ WHERE f.date = (SELECT MAX(date) FROM OEM_PROD.SDGM.F_REAL_WTG_MTBF_PERIOD)
 ORDER BY TRY_CAST(f.mtbf_7days AS FLOAT) ASC NULLS LAST LIMIT 7;
 """
 
-# Pg 4 — Maiores tempos por FALHA (top, hierárquica WTG→Alarme)
 Q_MAIORES_TEMPOS_FALHA = """
 WITH janela AS (
-    SELECT %(sab_atual)s::TIMESTAMP_NTZ AS ini, DATEADD(day,7,%(sab_fim)s)::TIMESTAMP_NTZ AS fim
+    SELECT %(janela_ini)s::TIMESTAMP_NTZ AS ini, %(janela_fim)s::TIMESTAMP_NTZ AS fim
 ),
 eventos AS (
     SELECT v.wtg, v.evento_parada, v.sistema_parada, v.data_inicio,
-        COALESCE(v.data_fim, j.fim) AS data_fim,
+        v.data_fim AS data_fim,
         GREATEST(DATEDIFF('second',
             GREATEST(v.data_inicio, j.ini),
-            LEAST(COALESCE(v.data_fim, j.fim), j.fim)
+            LEAST(COALESCE(v.data_fim, CURRENT_TIMESTAMP()), j.fim)
         ),0)/3600.0 AS horas
     FROM OEM_PROD.AVAILABILITY.F_REAL_EOL_WTG_EVENTLOG_VALIDATED_ALERTS v CROSS JOIN janela j
     WHERE v.cluster_oem = %(cluster)s AND v.validado = 'True'
       AND v.data_inicio < j.fim
-      AND COALESCE(v.data_fim, j.fim) > j.ini
+      AND COALESCE(v.data_fim, CURRENT_TIMESTAMP()) > j.ini
       AND v.motivo_parada = 'FALHA'
       AND v.responsabilidade IN ('Fabricante','Nenhum dos dois')
       AND v.sistema_parada NOT IN ('ENVIRONMENT','GRID CONNECTION')
@@ -155,29 +147,30 @@ eventos AS (
 wtg_total AS (SELECT wtg, SUM(horas) AS h_total FROM eventos GROUP BY wtg),
 top_wtgs AS (SELECT wtg, h_total FROM wtg_total ORDER BY h_total DESC LIMIT 10)
 SELECT t.wtg AS aerogerador, e.sistema_parada AS subsistema, e.evento_parada AS alarme,
-    COUNT(*) AS ocorrencias, MIN(e.data_inicio)::DATE AS data_inicio, MAX(e.data_fim)::DATE AS data_fim,
+    COUNT(*) AS ocorrencias, MIN(e.data_inicio)::DATE AS data_inicio,
+    MAX(e.data_fim)::DATE AS data_fim,
+    BOOLOR_AGG(e.data_fim IS NULL) AS em_aberto,
     ROUND(SUM(e.horas),4) AS horas_alarme, ROUND(t.h_total,4) AS horas_total_wtg
 FROM eventos e JOIN top_wtgs t ON t.wtg = e.wtg
 GROUP BY t.wtg, t.h_total, e.sistema_parada, e.evento_parada
 ORDER BY t.h_total DESC, horas_alarme DESC;
 """
 
-# Pg 4 — Maiores tempos por CORRETIVA (top 10)
 Q_MAIORES_TEMPOS_CORRETIVA = """
 WITH janela AS (
-    SELECT %(sab_atual)s::TIMESTAMP_NTZ AS ini, DATEADD(day,7,%(sab_fim)s)::TIMESTAMP_NTZ AS fim
+    SELECT %(janela_ini)s::TIMESTAMP_NTZ AS ini, %(janela_fim)s::TIMESTAMP_NTZ AS fim
 ),
 eventos AS (
     SELECT v.wtg, v.evento_parada, v.sistema_parada, v.motivo_parada, v.data_inicio,
-        COALESCE(v.data_fim, j.fim) AS data_fim,
+        v.data_fim AS data_fim,
         GREATEST(DATEDIFF('second',
             GREATEST(v.data_inicio, j.ini),
-            LEAST(COALESCE(v.data_fim, j.fim), j.fim)
+            LEAST(COALESCE(v.data_fim, CURRENT_TIMESTAMP()), j.fim)
         ),0)/3600.0 AS horas
     FROM OEM_PROD.AVAILABILITY.F_REAL_EOL_WTG_EVENTLOG_VALIDATED_ALERTS v CROSS JOIN janela j
     WHERE v.cluster_oem = %(cluster)s AND v.validado = 'True'
       AND v.data_inicio < j.fim
-      AND COALESCE(v.data_fim, j.fim) > j.ini
+      AND COALESCE(v.data_fim, CURRENT_TIMESTAMP()) > j.ini
       AND v.responsabilidade IN ('Fabricante','Nenhum dos dois')
       AND v.sistema_parada NOT IN ('ENVIRONMENT','GRID CONNECTION')
       AND v.motivo_parada IN ('FALHA','MANUTENCAO CORRETIVA NAO PLANEJADA',
@@ -190,13 +183,13 @@ top_wtgs AS (SELECT wtg, h_total FROM wtg_total ORDER BY h_total DESC LIMIT 10)
 SELECT t.wtg AS aerogerador, e.sistema_parada AS subsistema, e.motivo_parada AS motivo,
     e.evento_parada AS alarme, COUNT(*) AS ocorrencias,
     MIN(e.data_inicio)::DATE AS data_inicio, MAX(e.data_fim)::DATE AS data_fim,
+    BOOLOR_AGG(e.data_fim IS NULL) AS em_aberto,
     ROUND(SUM(e.horas),4) AS horas_alarme, ROUND(t.h_total,4) AS horas_total_wtg
 FROM eventos e JOIN top_wtgs t ON t.wtg = e.wtg
 GROUP BY t.wtg, t.h_total, e.sistema_parada, e.motivo_parada, e.evento_parada
 ORDER BY t.h_total DESC, horas_alarme DESC;
 """
 
-# Pg 5 — Temperatura Top N (inalterada)
 Q_TEMPERATURA_TOP5 = """
 WITH periodo AS (SELECT %(data_ini)s::DATE AS ini, %(data_fim)s::DATE AS fim),
 limites AS (
